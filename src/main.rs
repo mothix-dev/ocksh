@@ -1,5 +1,6 @@
 #![feature(let_chains)]
 
+pub mod ast;
 pub mod parser;
 
 use std::io::Write;
@@ -47,12 +48,12 @@ fn main() {
                     match err {
                         parser::ParseError::Unmatched(_) => {
                             if prompt(PS2, &mut input).expect("prompt failed") == 0 {
-                                eprintln!("{program_name}: syntax error: {}", err);
+                                eprintln!("{program_name}: {err}");
                                 break;
                             }
                         }
                         _ => {
-                            eprintln!("{program_name}: syntax error: {err}");
+                            eprintln!("{program_name}: {err}");
                             break;
                         }
                     }
@@ -69,14 +70,9 @@ fn main() {
 
         let script_contents = std::fs::read_to_string(script_name).expect("failed to read file");
 
-        for token in parser::Parser::new(&script_contents) {
-            match token {
-                Ok(t) => println!("{t:?}"),
-                Err(err) => {
-                    eprintln!("{program_name}: syntax error: {err}");
-                    std::process::exit(1);
-                }
-            }
+        match ast::parse_ast(parser::Parser::new(&script_contents)) {
+            Ok(res) => println!("{res:#?}"),
+            Err(err) => eprintln!("{program_name}: {err}"),
         }
     }
 }

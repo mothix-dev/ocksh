@@ -1,4 +1,5 @@
 use std::{collections::VecDeque, iter::Peekable, str::Chars};
+use thiserror::Error;
 
 #[derive(Debug, Clone)]
 pub enum WordPart<'a> {
@@ -20,7 +21,7 @@ pub enum WordPart<'a> {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Token<'a> {
     Word { parts: Vec<WordPart<'a>>, is_pattern: bool, is_assignment: bool },
     Heredoc { parts: Vec<WordPart<'a>>, file_descriptor: Option<u8> },
@@ -28,27 +29,20 @@ pub enum Token<'a> {
     Newline,
 }
 
-#[derive(Debug)]
+#[derive(Error, Debug, Clone)]
 pub enum ParseError {
-    Unmatched(&'static str),
-    Unexpected(&'static str),
-    ExpectedBefore(&'static str, &'static str),
-    ExpectedAfter(&'static str, char),
-    ExpectedWordAfter(&'static str),
+    #[error("syntax error: `{0}' unmatched")]
+    Unmatched(String),
+    #[error("syntax error: `{0}' unexpected")]
+    Unexpected(String),
+    #[error("syntax error: expected `{0}' before `{1}'")]
+    ExpectedBefore(String, String),
+    #[error("syntax error: expected `{0}' after `{1}'")]
+    ExpectedAfter(String, String),
+    #[error("syntax error: expected word after `{0}'")]
+    ExpectedWordAfter(String),
+    #[error("syntax error: expected variable name")]
     ExpectedVariableName,
-}
-
-impl std::fmt::Display for ParseError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Unmatched(i) => write!(f, "`{i}' unmatched"),
-            Self::Unexpected(i) => write!(f, "`{i}' unexpected"),
-            Self::ExpectedBefore(i, j) => write!(f, "expected `{i}' before `{j}'"),
-            Self::ExpectedAfter(i, j) => write!(f, "expected `{i}' after `{j}'"),
-            Self::ExpectedWordAfter(i) => write!(f, "expected word after `{i}'"),
-            Self::ExpectedVariableName => write!(f, "expected variable name"),
-        }
-    }
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -157,13 +151,7 @@ impl<'a> Parser<'a> {
                 Some(Ok(Token::Newline)) => break,
                 Some(Ok(token)) => self.queued_tokens.push_back(token),
                 Some(Err(e)) => return Err(e),
-                None => {
-                    if self.strip_leading_tabs {
-                        return Err(ParseError::Unmatched("<<-"));
-                    } else {
-                        return Err(ParseError::Unmatched("<<"));
-                    }
-                }
+                None => return Err(ParseError::Unmatched(self.heredoc_terminator.unwrap().into())),
             }
         }
 
@@ -179,13 +167,7 @@ impl<'a> Parser<'a> {
             Some(Ok(Token::Word { parts, .. })) => parts,
             Some(Ok(_)) => panic!("Parser::next() on heredoc should only return Token::word()"),
             Some(Err(e)) => return Err(e),
-            None => {
-                if self.strip_leading_tabs {
-                    return Err(ParseError::Unmatched("<<-"));
-                } else {
-                    return Err(ParseError::Unmatched("<<"));
-                }
-            }
+            None => return Err(ParseError::Unmatched(self.heredoc_terminator.unwrap().into())),
         };
 
         // outside of the heredoc now
@@ -228,8 +210,8 @@ impl<'a> Iterator for Parser<'a> {
                         loop {
                             match self.iter.peek()? {
                                 ' ' | '\t' => self.advance(),
-                                '\n' => return Some(Err(ParseError::Unexpected("newline"))),
-                                '#' => return Some(Err(ParseError::Unexpected("#"))),
+                                '\n' => return Some(Err(ParseError::Unexpected("newline".into()))),
+                                '#' => return Some(Err(ParseError::Unexpected("#".into()))),
                                 _ => break,
                             }
                         }
@@ -239,24 +221,14 @@ impl<'a> Iterator for Parser<'a> {
                         loop {
                             match self.iter.peek() {
                                 Some(' ') | Some('\t') | Some('\n') => break,
-                                None => {
-                                    if self.strip_leading_tabs {
-                                        return Some(Err(ParseError::ExpectedWordAfter("<<-")));
-                                    } else {
-                                        return Some(Err(ParseError::ExpectedWordAfter("<<")));
-                                    }
-                                }
+                                None => return Some(Err(ParseError::Unmatched(self.heredoc_terminator.unwrap().into()))),
                                 _ => self.advance(),
                             }
                         }
 
                         // throw an error if there's no terminator
                         if self.index == old_index {
-                            if self.strip_leading_tabs {
-                                return Some(Err(ParseError::ExpectedWordAfter("<<-")));
-                            } else {
-                                return Some(Err(ParseError::ExpectedWordAfter("<<")));
-                            }
+                            return Some(Err(ParseError::Unmatched(self.heredoc_terminator.unwrap().into())));
                         }
 
                         let mut is_quoted = false;
@@ -353,24 +325,20 @@ impl<'a> Iterator for Parser<'a> {
                     // handle error cases
                     if c.is_none() {
                         if self.heredoc_state != HeredocState::None {
-                            if self.strip_leading_tabs {
-                                return Some(Err(ParseError::Unmatched("<<-")));
-                            } else {
-                                return Some(Err(ParseError::Unmatched("<<")));
-                            }
+                            return Some(Err(ParseError::Unmatched(self.heredoc_terminator.unwrap().into())));
                         }
                         match quote_state {
                             QuoteState::None => (),
-                            QuoteState::Single => return Some(Err(ParseError::Unmatched("'"))),
-                            QuoteState::Double => return Some(Err(ParseError::Unmatched("\""))),
+                            QuoteState::Single => return Some(Err(ParseError::Unmatched("'".into()))),
+                            QuoteState::Double => return Some(Err(ParseError::Unmatched("\"".into()))),
                         }
                         if in_backtick {
-                            return Some(Err(ParseError::Unmatched("`")));
+                            return Some(Err(ParseError::Unmatched("`".into())));
                         }
                         match self.paren_stack.pop().map(|e| e.kind) {
                             None => (),
-                            Some(ParenKind::CommandSub) | Some(ParenKind::Subshell) | Some(ParenKind::Pattern) | Some(ParenKind::InnerMath) => return Some(Err(ParseError::Unmatched(")"))),
-                            Some(ParenKind::Math) | Some(ParenKind::MathSub) => return Some(Err(ParseError::Unmatched("))"))),
+                            Some(ParenKind::CommandSub) | Some(ParenKind::Subshell) | Some(ParenKind::Pattern) | Some(ParenKind::InnerMath) => return Some(Err(ParseError::Unmatched(")".into()))),
+                            Some(ParenKind::Math) | Some(ParenKind::MathSub) => return Some(Err(ParseError::Unmatched("))".into()))),
                         }
                     }
 
@@ -439,13 +407,7 @@ impl<'a> Iterator for Parser<'a> {
                                         break;
                                     }
                                 }
-                                None => {
-                                    if self.strip_leading_tabs {
-                                        return Some(Err(ParseError::Unmatched("<<-")));
-                                    } else {
-                                        return Some(Err(ParseError::Unmatched("<<")));
-                                    }
-                                }
+                                None => return Some(Err(ParseError::Unmatched(self.heredoc_terminator.unwrap().into()))),
                             }
                         }
 
@@ -490,8 +452,8 @@ impl<'a> Iterator for Parser<'a> {
                     if quote_state != QuoteState::Double && (self.heredoc_state == HeredocState::None || self.heredoc_state == HeredocState::Waiting) {
                         if let Some(top) = self.paren_stack.last() && top.is_quoted {
                             match top.kind {
-                                ParenKind::CommandSub | ParenKind::Subshell | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")"))),
-                                ParenKind::Math | ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))"))),
+                                ParenKind::CommandSub | ParenKind::Subshell | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")".into()))),
+                                ParenKind::Math | ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))".into()))),
                             }
                         }
 
@@ -514,8 +476,8 @@ impl<'a> Iterator for Parser<'a> {
                     if quote_state != QuoteState::Single && (self.heredoc_state == HeredocState::None || self.heredoc_state == HeredocState::Waiting) {
                         if let Some(top) = self.paren_stack.last() && top.is_quoted {
                             match top.kind {
-                                ParenKind::CommandSub | ParenKind::Subshell | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")"))),
-                                ParenKind::Math | ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))"))),
+                                ParenKind::CommandSub | ParenKind::Subshell | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")".into()))),
+                                ParenKind::Math | ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))".into()))),
                             }
                         }
 
@@ -554,7 +516,7 @@ impl<'a> Iterator for Parser<'a> {
                                 }
 
                                 // match some extra characters if we started on a < or >
-                                while let Some('<') | Some('>') | Some('|') | Some(';') | Some('&') | Some('0'..='9') | Some('-') = self.iter.peek() {
+                                while let Some('<') | Some('>') | Some('|') | Some(';') | Some('&') | Some('0'..='9') | Some('-') | Some('p') = self.iter.peek() {
                                     self.advance();
                                 }
                             }
@@ -591,8 +553,8 @@ impl<'a> Iterator for Parser<'a> {
                     if quote_state != QuoteState::Single {
                         if let Some(top) = self.paren_stack.last() && top.in_backtick && in_backtick {
                             match top.kind {
-                                ParenKind::CommandSub | ParenKind::Subshell | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")"))),
-                                ParenKind::Math | ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))"))),
+                                ParenKind::CommandSub | ParenKind::Subshell | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")".into()))),
+                                ParenKind::Math | ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))".into()))),
                             }
                         }
 
@@ -655,7 +617,7 @@ impl<'a> Iterator for Parser<'a> {
                                         self.advance();
                                     }
                                     Some(_) => return Some(Err(ParseError::ExpectedVariableName)),
-                                    None => return Some(Err(ParseError::Unmatched("}"))),
+                                    None => return Some(Err(ParseError::Unmatched("}".into()))),
                                 }
                                 let name = &self.string[self.old_index..self.index];
 
@@ -664,7 +626,7 @@ impl<'a> Iterator for Parser<'a> {
                                 loop {
                                     match self.iter.peek() {
                                         Some('}') => break,
-                                        None => return Some(Err(ParseError::Unmatched("}"))),
+                                        None => return Some(Err(ParseError::Unmatched("}".into()))),
                                         _ => self.advance(),
                                     }
                                 }
@@ -722,7 +684,7 @@ impl<'a> Iterator for Parser<'a> {
                                         is_quoted: quote_state != QuoteState::None,
                                         in_backtick,
                                     }),
-                                    None => return Some(Err(ParseError::Unmatched(")"))),
+                                    None => return Some(Err(ParseError::Unmatched(")".into()))),
                                 }
 
                                 self.old_index = self.index;
@@ -740,7 +702,7 @@ impl<'a> Iterator for Parser<'a> {
                     if quote_state == QuoteState::None {
                         if let Some(entry) = self.paren_stack.last() {
                             match entry.kind {
-                                ParenKind::Math | ParenKind::MathSub => {
+                                ParenKind::Math | ParenKind::MathSub | ParenKind::InnerMath => {
                                     self.advance();
                                     self.paren_stack.push(ParenStackEntry {
                                         kind: ParenKind::InnerMath,
@@ -787,7 +749,7 @@ impl<'a> Iterator for Parser<'a> {
                                 is_quoted: quote_state != QuoteState::None,
                                 in_backtick,
                             }),
-                            None => return Some(Err(ParseError::Unmatched(")"))),
+                            None => return Some(Err(ParseError::Unmatched(")".into()))),
                         }
 
                         if return_val.is_some() {
@@ -799,36 +761,40 @@ impl<'a> Iterator for Parser<'a> {
                     }
                 }
                 Some(')') => {
-                    if quote_state != QuoteState::Single && let Some(entry) = self.paren_stack.last() && entry.in_backtick == in_backtick && entry.kind != ParenKind::Pattern && entry.kind != ParenKind::InnerMath {
-                        if entry.kind == ParenKind::Math || entry.kind == ParenKind::MathSub {
-                            let old_index = self.index;
+                    if quote_state != QuoteState::Single && let Some(entry) = self.paren_stack.last() && entry.in_backtick == in_backtick {
+                        if entry.kind == ParenKind::Pattern || entry.kind == ParenKind::InnerMath {
+                            self.paren_stack.pop();
+                        } else {
+                            if entry.kind == ParenKind::Math || entry.kind == ParenKind::MathSub {
+                                let old_index = self.index;
 
-                            self.advance();
-                            match self.iter.peek() {
-                                Some(')') => (),
-                                Some(_) => continue,
-                                None => return Some(Err(ParseError::Unmatched("))"))),
+                                self.advance();
+                                match self.iter.peek() {
+                                    Some(')') => (),
+                                    Some(_) => continue,
+                                    None => return Some(Err(ParseError::Unmatched("))".into()))),
+                                }
+
+                                let new_index = core::mem::replace(&mut self.index, old_index);
+                                self.append_slice();
+                                self.index = new_index;
+                            } else {
+                                self.append_slice();
                             }
 
-                            let new_index = core::mem::replace(&mut self.index, old_index);
-                            self.append_slice();
-                            self.index = new_index;
-                        } else {
-                            self.append_slice();
+                            let entry = self.paren_stack.pop().unwrap();
+
+                            let parts = std::mem::replace(&mut self.word_parts, std::mem::take(&mut entry.old_word_parts.unwrap()));
+                            match entry.kind {
+                                ParenKind::CommandSub => self.word_parts.push(WordPart::CommandSub(parts)),
+                                ParenKind::Subshell => self.word_parts.push(WordPart::Subshell(parts)),
+                                ParenKind::MathSub => self.word_parts.push(WordPart::MathSub(parts)),
+                                ParenKind::Math => self.word_parts.push(WordPart::Math(parts)),
+                                ParenKind::Pattern | ParenKind::InnerMath => unreachable!(),
+                            }
+
+                            self.old_index = self.index + 1;
                         }
-
-                        let entry = self.paren_stack.pop().unwrap();
-
-                        let parts = std::mem::replace(&mut self.word_parts, std::mem::take(&mut entry.old_word_parts.unwrap()));
-                        match entry.kind {
-                            ParenKind::CommandSub => self.word_parts.push(WordPart::CommandSub(parts)),
-                            ParenKind::Subshell => self.word_parts.push(WordPart::Subshell(parts)),
-                            ParenKind::MathSub => self.word_parts.push(WordPart::MathSub(parts)),
-                            ParenKind::Math => self.word_parts.push(WordPart::Math(parts)),
-                            ParenKind::Pattern | ParenKind::InnerMath => unreachable!(),
-                        }
-
-                        self.old_index = self.index + 1;
                     }
                 }
                 Some('=') => {
