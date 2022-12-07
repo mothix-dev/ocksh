@@ -8,7 +8,6 @@ pub enum WordPart<'a> {
     CommandSub(Vec<WordPart<'a>>),
     MathSub(Vec<WordPart<'a>>),
     Math(Vec<WordPart<'a>>),
-    Subshell(Vec<WordPart<'a>>),
     Variable {
         name: &'a str,
         quoted: bool,
@@ -43,14 +42,14 @@ pub enum ParseError {
     ExpectedWordAfter(String),
     #[error("syntax error: expected variable name")]
     ExpectedVariableName,
+    #[error("syntax error: invalid pattern in `case' statement (patterns must end in an unquoted closing parenthesis)")]
+    InvalidCasePattern,
 }
 
 #[derive(PartialEq, Eq, Debug)]
 enum ParenKind {
-    Subshell,
     CommandSub,
     MathSub,
-    Math,
     InnerMath,
     Pattern,
 }
@@ -124,9 +123,9 @@ impl<'a> Parser<'a> {
     }
 
     fn append_slice_quoted(&mut self) {
-        if self.index > self.old_index {
-            self.word_parts.push(WordPart::QuotedString(&self.string[self.old_index..self.index]));
-        }
+        //if self.index > self.old_index {
+        self.word_parts.push(WordPart::QuotedString(&self.string[self.old_index..self.index]));
+        //}
     }
 
     fn process_heredoc(&mut self, r: &'a str, terminator: WordPart<'a>) -> Result<Token<'a>, ParseError> {
@@ -277,7 +276,11 @@ impl<'a> Iterator for Parser<'a> {
                 // if we run out of chars we can just return None here
                 match self.iter.peek()? {
                     ' ' | '\t' => (),
-                    '\n' => is_in_comment = false,
+                    '\n' => {
+                        if is_in_comment {
+                            break;
+                        }
+                    }
                     '#' => is_in_comment = true,
                     _ => {
                         if !is_in_comment {
@@ -337,8 +340,8 @@ impl<'a> Iterator for Parser<'a> {
                         }
                         match self.paren_stack.pop().map(|e| e.kind) {
                             None => (),
-                            Some(ParenKind::CommandSub) | Some(ParenKind::Subshell) | Some(ParenKind::Pattern) | Some(ParenKind::InnerMath) => return Some(Err(ParseError::Unmatched(")".into()))),
-                            Some(ParenKind::Math) | Some(ParenKind::MathSub) => return Some(Err(ParseError::Unmatched("))".into()))),
+                            Some(ParenKind::CommandSub) | Some(ParenKind::Pattern) | Some(ParenKind::InnerMath) => return Some(Err(ParseError::Unmatched(")".into()))),
+                            Some(ParenKind::MathSub) => return Some(Err(ParseError::Unmatched("))".into()))),
                         }
                     }
 
@@ -452,8 +455,8 @@ impl<'a> Iterator for Parser<'a> {
                     if quote_state != QuoteState::Double && (self.heredoc_state == HeredocState::None || self.heredoc_state == HeredocState::Waiting) {
                         if let Some(top) = self.paren_stack.last() && top.is_quoted {
                             match top.kind {
-                                ParenKind::CommandSub | ParenKind::Subshell | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")".into()))),
-                                ParenKind::Math | ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))".into()))),
+                                ParenKind::CommandSub | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")".into()))),
+                                ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))".into()))),
                             }
                         }
 
@@ -476,8 +479,8 @@ impl<'a> Iterator for Parser<'a> {
                     if quote_state != QuoteState::Single && (self.heredoc_state == HeredocState::None || self.heredoc_state == HeredocState::Waiting) {
                         if let Some(top) = self.paren_stack.last() && top.is_quoted {
                             match top.kind {
-                                ParenKind::CommandSub | ParenKind::Subshell | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")".into()))),
-                                ParenKind::Math | ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))".into()))),
+                                ParenKind::CommandSub | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")".into()))),
+                                ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))".into()))),
                             }
                         }
 
@@ -553,8 +556,8 @@ impl<'a> Iterator for Parser<'a> {
                     if quote_state != QuoteState::Single {
                         if let Some(top) = self.paren_stack.last() && top.in_backtick && in_backtick {
                             match top.kind {
-                                ParenKind::CommandSub | ParenKind::Subshell | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")".into()))),
-                                ParenKind::Math | ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))".into()))),
+                                ParenKind::CommandSub | ParenKind::Pattern | ParenKind::InnerMath => return Some(Err(ParseError::Unmatched(")".into()))),
+                                ParenKind::MathSub => return Some(Err(ParseError::Unmatched("))".into()))),
                             }
                         }
 
@@ -702,7 +705,7 @@ impl<'a> Iterator for Parser<'a> {
                     if quote_state == QuoteState::None {
                         if let Some(entry) = self.paren_stack.last() {
                             match entry.kind {
-                                ParenKind::Math | ParenKind::MathSub | ParenKind::InnerMath => {
+                                ParenKind::MathSub | ParenKind::InnerMath => {
                                     self.advance();
                                     self.paren_stack.push(ParenStackEntry {
                                         kind: ParenKind::InnerMath,
@@ -717,46 +720,26 @@ impl<'a> Iterator for Parser<'a> {
                         }
 
                         self.append_slice();
+                        self.old_index = self.index;
 
-                        let return_val = if !in_backtick && self.paren_stack.is_empty() {
-                            if !self.word_parts.is_empty() {
-                                Some(Ok(Token::Word {
-                                    parts: std::mem::take(&mut self.word_parts),
-                                    is_pattern,
-                                    is_assignment,
-                                }))
-                            } else {
-                                self.next_token.take().map(Ok)
-                            }
-                        } else {
-                            None
-                        };
-
-                        self.advance();
-                        match self.iter.peek() {
-                            Some('(') => {
-                                self.advance();
-                                self.paren_stack.push(ParenStackEntry {
-                                    kind: ParenKind::Math,
-                                    old_word_parts: Some(std::mem::take(&mut self.word_parts)),
-                                    is_quoted: quote_state != QuoteState::None,
-                                    in_backtick,
-                                });
-                            }
-                            Some(_) => self.paren_stack.push(ParenStackEntry {
-                                kind: ParenKind::Subshell,
-                                old_word_parts: Some(std::mem::take(&mut self.word_parts)),
-                                is_quoted: quote_state != QuoteState::None,
-                                in_backtick,
-                            }),
-                            None => return Some(Err(ParseError::Unmatched(")".into()))),
+                        while let Some('(') | Some(')') = self.iter.peek() {
+                            self.advance();
                         }
 
-                        if return_val.is_some() {
-                            return return_val;
+                        self.next_token = Some(Token::Reserved(&self.string[self.old_index..self.index]));
+
+                        if let Some('\n') = self.iter.peek() {
+                            self.next_token_2 = Some(Token::Newline);
+                        }
+
+                        if !self.word_parts.is_empty() {
+                            return Some(Ok(Token::Word {
+                                parts: std::mem::take(&mut self.word_parts),
+                                is_pattern,
+                                is_assignment,
+                            }));
                         } else {
-                            self.old_index = self.index;
-                            continue;
+                            return self.next();
                         }
                     }
                 }
@@ -765,7 +748,7 @@ impl<'a> Iterator for Parser<'a> {
                         if entry.kind == ParenKind::Pattern || entry.kind == ParenKind::InnerMath {
                             self.paren_stack.pop();
                         } else {
-                            if entry.kind == ParenKind::Math || entry.kind == ParenKind::MathSub {
+                            if entry.kind == ParenKind::MathSub {
                                 let old_index = self.index;
 
                                 self.advance();
@@ -787,13 +770,34 @@ impl<'a> Iterator for Parser<'a> {
                             let parts = std::mem::replace(&mut self.word_parts, std::mem::take(&mut entry.old_word_parts.unwrap()));
                             match entry.kind {
                                 ParenKind::CommandSub => self.word_parts.push(WordPart::CommandSub(parts)),
-                                ParenKind::Subshell => self.word_parts.push(WordPart::Subshell(parts)),
                                 ParenKind::MathSub => self.word_parts.push(WordPart::MathSub(parts)),
-                                ParenKind::Math => self.word_parts.push(WordPart::Math(parts)),
                                 ParenKind::Pattern | ParenKind::InnerMath => unreachable!(),
                             }
 
                             self.old_index = self.index + 1;
+                        }
+                    } else {
+                        self.append_slice();
+                        self.old_index = self.index;
+
+                        while let Some(')') = self.iter.peek() {
+                            self.advance();
+                        }
+
+                        self.next_token = Some(Token::Reserved(&self.string[self.old_index..self.index]));
+
+                        if let Some('\n') = self.iter.peek() {
+                            self.next_token_2 = Some(Token::Newline);
+                        }
+
+                        if !self.word_parts.is_empty() {
+                            return Some(Ok(Token::Word {
+                                parts: std::mem::take(&mut self.word_parts),
+                                is_pattern,
+                                is_assignment,
+                            }));
+                        } else {
+                            return self.next();
                         }
                     }
                 }
